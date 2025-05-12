@@ -23,10 +23,13 @@
 static const std::string MAP_FILE_NAME = "/map.txt";
 static const std::string CONTENT_FILE_NAME = "/content.txt";
 static const std::string LOG_FILE_NAME = "/log.txt";
-static const bool isParallel = true;
+static const bool isParallel = false;
 
 // kolikrat se ma provest experiment (a mereni)
 constexpr size_t RunCount = 5;
+
+int g_numWorkersA = 0;
+int g_numWorkersB = 0;
 
 // Funkce pro měření výkonu - spustí danou funkci několikrát a měří průměrný čas
 void Do_Measure(const std::string& name, void(*fnc)())
@@ -62,6 +65,13 @@ void Do_Measure(const std::string& name, void(*fnc)())
 
     std::cout << "Average time: " << tm << "ms" << std::endl << std::endl;
 }
+
+enum MpiTags {
+    URL_TASK,
+    URL_RESULT,
+    CONTENT_RESULT,
+    TERMINATE
+};
 
  // Структура для зберігання результатів аналізу сторінки
  struct PageAnalysisResult {
@@ -417,11 +427,512 @@ void createLog(const auto& resultDir, const auto& results, const auto& startTime
      std::cout << "Total time: " << elapsed << " ms" << std::endl;
  }
 
+
+ // Майстер процес - розподіляє роботу і збирає результати
+void masterProcess(const std::vector<std::string>& URLs, int numWorkerA, int numWorkerB, std::string& output) {
+    int numUrls = URLs.size();
+
+    // Перевіряємо, чи є що розподіляти
+    if (numUrls == 0) {
+        output = "<h2>Немає URL для обробки</h2>";
+
+        // Повідомляємо всім воркерам A про завершення
+        for (int i = 1; i <= numWorkerA; ++i) {
+            int terminate = -1;
+            MPI_Send(&terminate, 1, MPI_INT, i, URL_TASK, MPI_COMM_WORLD);
+        }
+        return;
+    }
+
+    std::string startTime = getLogDateTime();
+    std::cout << "Master: Starting processing " << numUrls << " URLs" << std::endl;
+
+    // Розподіл URL між воркерами A
+    for (int i = 0; i < numUrls; ++i) {
+        int workerA = (i % numWorkerA) + 1; // Worker A має ID від 1 до N
+
+        // Відправка URL до воркера A
+        std::string url = URLs[i];
+        int urlLength = url.length();
+
+        std::cout << "Master: Sending URL to worker A " << workerA << ": " << url << std::endl;
+
+        MPI_Send(&urlLength, 1, MPI_INT, workerA, URL_TASK, MPI_COMM_WORLD);
+        MPI_Send(url.c_str(), urlLength, MPI_CHAR, workerA, URL_TASK, MPI_COMM_WORLD);
+    }
+
+    // Повідомлення всім воркерам A про завершення розподілу задач
+    for (int i = 1; i <= numWorkerA; ++i) {
+        int terminate = -1;
+        std::cout << "Master: Sending termination signal to worker A " << i << std::endl;
+        MPI_Send(&terminate, 1, MPI_INT, i, URL_TASK, MPI_COMM_WORLD);
+    }
+
+    // Створення каталогу для результатів
+    std::filesystem::create_directory("results");
+
+    // Отримання результатів від воркерів A
+    output = "<h2>Результати краулінгу</h2><ul>";
+
+    for (int i = 0; i < numUrls; ++i) {
+        // Отримуємо результати від будь-якого воркера A
+        MPI_Status status;
+        int mapSizeReceived;
+
+        std::cout << "Master: Waiting for results #" << (i+1) << " of " << numUrls << std::endl;
+
+        MPI_Recv(&mapSizeReceived, 1, MPI_INT, MPI_ANY_SOURCE, URL_RESULT, MPI_COMM_WORLD, &status);
+
+        int workerA = status.MPI_SOURCE;
+        std::cout << "Master: Received map size from worker A " << workerA << ": " << mapSizeReceived << std::endl;
+
+        char* mapBuffer = new char[mapSizeReceived + 1];
+        MPI_Recv(mapBuffer, mapSizeReceived, MPI_CHAR, workerA, URL_RESULT, MPI_COMM_WORLD, &status);
+        mapBuffer[mapSizeReceived] = '\0';
+        std::string mapData(mapBuffer);
+        delete[] mapBuffer;
+
+        int contentSizeReceived;
+        MPI_Recv(&contentSizeReceived, 1, MPI_INT, workerA, CONTENT_RESULT, MPI_COMM_WORLD, &status);
+
+        std::cout << "Master: Received content size from worker A " << workerA << ": " << contentSizeReceived << std::endl;
+
+        char* contentBuffer = new char[contentSizeReceived + 1];
+        MPI_Recv(contentBuffer, contentSizeReceived, MPI_CHAR, workerA, CONTENT_RESULT, MPI_COMM_WORLD, &status);
+        contentBuffer[contentSizeReceived] = '\0';
+        std::string contentData(contentBuffer);
+        delete[] contentBuffer;
+
+        // Отримуємо URL, для якого воркер надіслав результати
+        int urlSizeReceived;
+        MPI_Recv(&urlSizeReceived, 1, MPI_INT, workerA, URL_RESULT, MPI_COMM_WORLD, &status);
+
+        char* urlBuffer = new char[urlSizeReceived + 1];
+        MPI_Recv(urlBuffer, urlSizeReceived, MPI_CHAR, workerA, URL_RESULT, MPI_COMM_WORLD, &status);
+        urlBuffer[urlSizeReceived] = '\0';
+        std::string crawledUrl(urlBuffer);
+        delete[] urlBuffer;
+
+        std::cout << "Master: Processed URL: " << crawledUrl << std::endl;
+
+        // Створення каталогу для результатів цього URL
+        std::string safeUrlName = urlToSafeFilename(crawledUrl);
+        std::string resultDirName = getCurrentDateTime() + "_" + safeUrlName;
+        std::string resultDir = "results/" + resultDirName;
+        std::filesystem::create_directory(resultDir);
+
+        // Запис файлів з результатами
+        std::ofstream mapFile(resultDir + "/map.txt");
+        mapFile << mapData;
+        mapFile.close();
+
+        std::ofstream contentFile(resultDir + "/content.txt");
+        contentFile << contentData;
+        contentFile.close();
+
+        std::string endTime = getLogDateTime();
+
+        std::ofstream logFile(resultDir + "/log.txt");
+        logFile << startTime << std::endl;
+        logFile << endTime << std::endl;
+        logFile << "OK" << std::endl;
+        logFile.close();
+
+        output += "<li>Оброблено URL: " + crawledUrl + " - результати збережено в " + resultDirName + "</li>";
+    }
+
+    output += "</ul>";
+    std::cout << "Master: All URLs processed successfully" << std::endl;
+}
+
+
+// Worker A - керує групою Worker B і відповідає за одну домену
+void workerA(int myRank, int numWorkerB, int numWorkerA) {
+    int firstWorkerB = (numWorkerB * myRank) - numWorkerB + numWorkerA + 1;
+    std::vector<int> availableWorkersB;
+    int busyWorkersB = 0; // Лічильник занятих Worker B
+
+    std::cout << "Worker A " << myRank << ": Starting with first Worker B = " << firstWorkerB << std::endl;
+
+    // Ініціалізація списку доступних Worker B
+    for (int i = 0; i < numWorkerB; ++i) {
+        availableWorkersB.push_back(firstWorkerB + i);
+    }
+
+    while (true) {
+        MPI_Status status;
+        int urlLength;
+
+        std::cout << "Worker A " << myRank << ": Waiting for URL task" << std::endl;
+        MPI_Recv(&urlLength, 1, MPI_INT, 0, URL_TASK, MPI_COMM_WORLD, &status);
+
+        // Перевірка на сигнал завершення
+        if (urlLength == -1) {
+            std::cout << "Worker A " << myRank << ": Received termination signal" << std::endl;
+            break;
+        }
+
+        // Отримання URL
+        char* urlBuffer = new char[urlLength + 1];
+        MPI_Recv(urlBuffer, urlLength, MPI_CHAR, 0, URL_TASK, MPI_COMM_WORLD, &status);
+        urlBuffer[urlLength] = '\0';
+        std::string startUrl(urlBuffer);
+        delete[] urlBuffer;
+
+        std::cout << "Worker A " << myRank << ": Processing URL: " << startUrl << std::endl;
+
+        // Структури даних для відстеження обходу
+        std::queue<std::string> urlQueue;
+        std::unordered_set<std::string> visitedUrls;
+        std::unordered_map<std::string, PageAnalysisResult> results;
+        std::string baseUrl = getBaseUrl(startUrl);
+
+        urlQueue.push(startUrl);
+        visitedUrls.insert(startUrl);
+
+        int processedUrls = 0;
+        int maxUrlsToProcess = 100; // Обмеження для уникнення нескінченного обходу
+
+        // Обробка всіх URL для цієї домени
+        while ((!urlQueue.empty() || busyWorkersB > 0) && processedUrls < maxUrlsToProcess) {
+            // Призначаємо роботу доступним Worker B, якщо є URL в черзі
+            while (!urlQueue.empty() && !availableWorkersB.empty() && processedUrls < maxUrlsToProcess) {
+                std::string currentUrl = urlQueue.front();
+                urlQueue.pop();
+
+                // Отримання доступного Worker B
+                int workerB = availableWorkersB.back();
+                availableWorkersB.pop_back();
+                busyWorkersB++; // Збільшуємо лічильник занятих Worker B
+
+                std::cout << "Worker A " << myRank << ": Assigning URL to Worker B " << workerB
+                          << ": " << currentUrl << " (busy workers: " << busyWorkersB << ")" << std::endl;
+
+                // Відправка URL до Worker B
+                int urlLength = currentUrl.length();
+                MPI_Send(&urlLength, 1, MPI_INT, workerB, URL_TASK, MPI_COMM_WORLD);
+                MPI_Send(currentUrl.c_str(), urlLength, MPI_CHAR, workerB, URL_TASK, MPI_COMM_WORLD);
+            }
+
+            // Очікуємо результат від Worker B, якщо є зайняті воркери
+            if (busyWorkersB > 0) {
+                // Отримання результату від Worker B і додавання його назад у список доступних
+                int workerB;
+
+                std::cout << "Worker A " << myRank << ": Waiting for any Worker B to finish (busy: "
+                          << busyWorkersB << ")" << std::endl;
+                MPI_Status b_status;
+                MPI_Recv(&workerB, 1, MPI_INT, MPI_ANY_SOURCE, TERMINATE, MPI_COMM_WORLD, &b_status);
+
+                workerB = b_status.MPI_SOURCE; // використовуємо реальне джерело повідомлення
+                availableWorkersB.push_back(workerB);
+                busyWorkersB--; // Зменшуємо лічильник занятих Worker B
+
+                std::cout << "Worker A " << myRank << ": Worker B " << workerB
+                          << " finished (remaining busy: " << busyWorkersB << ")" << std::endl;
+
+                // Отримання результатів аналізу
+                int urlLength;
+                MPI_Recv(&urlLength, 1, MPI_INT, workerB, URL_RESULT, MPI_COMM_WORLD, &b_status);
+
+                char* urlBuffer = new char[urlLength + 1];
+                MPI_Recv(urlBuffer, urlLength, MPI_CHAR, workerB, URL_RESULT, MPI_COMM_WORLD, &b_status);
+                urlBuffer[urlLength] = '\0';
+                std::string analyzedUrl(urlBuffer);
+                delete[] urlBuffer;
+
+                std::cout << "Worker A " << myRank << ": Received analysis for URL: " << analyzedUrl << std::endl;
+
+                // Отримання кількості зображень, посилань, форм
+                int imageCount, linkCount, formCount, headersCount;
+                MPI_Recv(&imageCount, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+                MPI_Recv(&linkCount, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+                MPI_Recv(&formCount, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+                MPI_Recv(&headersCount, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+
+                // Отримання заголовків
+                PageAnalysisResult result;
+                result.url = analyzedUrl;
+                result.imageCount = imageCount;
+                result.linkCount = linkCount;
+                result.formCount = formCount;
+
+                for (int i = 0; i < headersCount; i++) {
+                    int level;
+                    MPI_Recv(&level, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+
+                    int textLength;
+                    MPI_Recv(&textLength, 1, MPI_INT, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+
+                    char* textBuffer = new char[textLength + 1];
+                    MPI_Recv(textBuffer, textLength, MPI_CHAR, workerB, CONTENT_RESULT, MPI_COMM_WORLD, &b_status);
+                    textBuffer[textLength] = '\0';
+
+                    result.headers.push_back({level, std::string(textBuffer)});
+                    delete[] textBuffer;
+                }
+
+                // Отримання знайдених URL
+                int urlsCount;
+                MPI_Recv(&urlsCount, 1, MPI_INT, workerB, URL_RESULT, MPI_COMM_WORLD, &b_status);
+
+                std::cout << "Worker A " << myRank << ": URL " << analyzedUrl << " has " << urlsCount << " links" << std::endl;
+
+                for (int i = 0; i < urlsCount; i++) {
+                    int foundUrlLength;
+                    MPI_Recv(&foundUrlLength, 1, MPI_INT, workerB, URL_RESULT, MPI_COMM_WORLD, &b_status);
+
+                    char* foundUrlBuffer = new char[foundUrlLength + 1];
+                    MPI_Recv(foundUrlBuffer, foundUrlLength, MPI_CHAR, workerB, URL_RESULT, MPI_COMM_WORLD, &b_status);
+                    foundUrlBuffer[foundUrlLength] = '\0';
+                    std::string foundUrl(foundUrlBuffer);
+                    delete[] foundUrlBuffer;
+
+                    result.foundUrls.push_back(foundUrl);
+
+                    // Додавання нових URL в чергу
+                    if (visitedUrls.find(foundUrl) == visitedUrls.end() && isSameDomain(baseUrl, foundUrl)) {
+                        urlQueue.push(foundUrl);
+                        visitedUrls.insert(foundUrl);
+                    }
+                }
+
+                results[analyzedUrl] = result;
+                processedUrls++;
+            } else if (urlQueue.empty()) {
+                // Якщо немає більше URL в черзі і немає занятих Worker B, виходимо з циклу
+                break;
+            }
+        }
+
+        // Повідомлення про завершення для всіх воркерів B
+        std::cout << "Worker A " << myRank << ": Sending termination to all Worker B processes" << std::endl;
+        for (int i = 0; i < numWorkerB; i++) {
+            int currentWorkerB = firstWorkerB + i;
+            int terminate = -1;
+            MPI_Send(&terminate, 1, MPI_INT, currentWorkerB, URL_TASK, MPI_COMM_WORLD);
+        }
+
+        // Очікування завершення всіх Worker B
+        while (availableWorkersB.size() < numWorkerB) {
+            int workerB;
+            MPI_Status b_status;
+            MPI_Recv(&workerB, 1, MPI_INT, MPI_ANY_SOURCE, TERMINATE, MPI_COMM_WORLD, &b_status);
+
+            workerB = b_status.MPI_SOURCE;
+            bool alreadyAvailable = false;
+            for (int wb : availableWorkersB) {
+                if (wb == workerB) {
+                    alreadyAvailable = true;
+                    break;
+                }
+            }
+
+            if (!alreadyAvailable) {
+                availableWorkersB.push_back(workerB);
+                std::cout << "Worker A " << myRank << ": Worker B " << workerB << " finished (final)" << std::endl;
+            }
+        }
+
+        // Підготовка результатів для відправки назад майстру
+        std::stringstream mapSs, contentSs;
+
+        // Обмеження кількості URL для майстра (якщо їх забагато)
+        int maxUrlsToReport = 1000;
+        std::vector<std::string> urlsToReport;
+
+        for (const auto& pair : results) {
+            if (urlsToReport.size() < maxUrlsToReport) {
+                urlsToReport.push_back(pair.first);
+            }
+        }
+
+        // Запис вузлів графа
+        for (const auto& url : urlsToReport) {
+            mapSs << url << std::endl;
+        }
+
+        // Запис ребер графа
+        for (const auto& url : urlsToReport) {
+            const auto& result = results[url];
+            for (const std::string& targetUrl : result.foundUrls) {
+                if (results.find(targetUrl) != results.end()) {
+                    mapSs << url << " " << targetUrl << std::endl;
+                }
+            }
+        }
+
+        // Запис даних про контент
+        for (const auto& url : urlsToReport) {
+            const auto& result = results[url];
+            contentSs << url << std::endl;
+            contentSs << "IMAGES " << result.imageCount << std::endl;
+            contentSs << "LINKS " << result.linkCount << std::endl;
+            contentSs << "FORMS " << result.formCount << std::endl;
+
+            for (const auto& header : result.headers) {
+                for (int i = 0; i < header.first; i++) {
+                    contentSs << "-";
+                }
+                contentSs << " " << header.second << std::endl;
+            }
+            contentSs << std::endl;
+        }
+
+        // Відправка результатів до майстра
+        std::string mapData = mapSs.str();
+        int mapSize = mapData.length();
+
+        std::cout << "Worker A " << myRank << ": Sending map data to master (" << mapSize << " bytes)" << std::endl;
+
+        MPI_Send(&mapSize, 1, MPI_INT, 0, URL_RESULT, MPI_COMM_WORLD);
+        MPI_Send(mapData.c_str(), mapSize, MPI_CHAR, 0, URL_RESULT, MPI_COMM_WORLD);
+
+        std::string contentData = contentSs.str();
+        int contentSize = contentData.length();
+
+        std::cout << "Worker A " << myRank << ": Sending content data to master (" << contentSize << " bytes)" << std::endl;
+
+        MPI_Send(&contentSize, 1, MPI_INT, 0, CONTENT_RESULT, MPI_COMM_WORLD);
+        MPI_Send(contentData.c_str(), contentSize, MPI_CHAR, 0, CONTENT_RESULT, MPI_COMM_WORLD);
+
+        // Відправка оригінального URL
+        int urlSize = startUrl.length();
+
+        std::cout << "Worker A " << myRank << ": Sending original URL to master: " << startUrl << std::endl;
+
+        MPI_Send(&urlSize, 1, MPI_INT, 0, URL_RESULT, MPI_COMM_WORLD);
+        MPI_Send(startUrl.c_str(), urlSize, MPI_CHAR, 0, URL_RESULT, MPI_COMM_WORLD);
+    }
+
+    std::cout << "Worker A " << myRank << ": Exiting" << std::endl;
+}
+
+void workerB(int myRank, int masterA) {
+    std::cout << "Worker B " << myRank << ": Starting with master A = " << masterA << std::endl;
+
+    while (true) {
+        MPI_Status status;
+        int urlLength;
+
+        std::cout << "Worker B " << myRank << ": Waiting for URL task" << std::endl;
+        MPI_Recv(&urlLength, 1, MPI_INT, masterA, URL_TASK, MPI_COMM_WORLD, &status);
+
+        // Перевірка на сигнал завершення
+        if (urlLength == -1) {
+            std::cout << "Worker B " << myRank << ": Received termination signal" << std::endl;
+            break;
+        }
+
+        // Отримання URL
+        char* urlBuffer = new char[urlLength + 1];
+        MPI_Recv(urlBuffer, urlLength, MPI_CHAR, masterA, URL_TASK, MPI_COMM_WORLD, &status);
+        urlBuffer[urlLength] = '\0';
+        std::string url(urlBuffer);
+        delete[] urlBuffer;
+
+        std::cout << "Worker B " << myRank << ": Processing URL: " << url << std::endl;
+
+        // Завантаження і аналіз HTML
+        std::string html;
+        html = utils::downloadHTML(url);
+        std::cout << "Worker B " << myRank << ": Downloaded HTML of size: " << html.length() << std::endl;
+
+        PageAnalysisResult result;
+        result = analyzeHtml(url, html);
+        std::cout << "Worker B " << myRank << ": Analyzed HTML, found " << result.foundUrls.size() << " URLs" << std::endl;
+        // Захист від завеликих даних
+        const int MAX_URLS = 100;
+        if (result.foundUrls.size() > MAX_URLS) {
+            std::cout << "Worker B " << myRank << ": Limiting found URLs from " << result.foundUrls.size() << " to " << MAX_URLS << std::endl;
+            result.foundUrls.resize(MAX_URLS);
+        }
+
+        // Відправка результатів назад до Worker A
+        std::cout << "Worker B " << myRank << ": Sending results back to Worker A " << masterA << std::endl;
+        MPI_Send(&myRank, 1, MPI_INT, masterA, TERMINATE, MPI_COMM_WORLD);
+
+        // Відправка URL
+        urlLength = result.url.length();
+        MPI_Send(&urlLength, 1, MPI_INT, masterA, URL_RESULT, MPI_COMM_WORLD);
+        MPI_Send(result.url.c_str(), urlLength, MPI_CHAR, masterA, URL_RESULT, MPI_COMM_WORLD);
+
+        // Відправка інформації про контент
+        MPI_Send(&result.imageCount, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+        MPI_Send(&result.linkCount, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+        MPI_Send(&result.formCount, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+
+        // Відправка заголовків
+        int headersCount = result.headers.size();
+        MPI_Send(&headersCount, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+
+        for (const auto& header : result.headers) {
+            MPI_Send(&header.first, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+
+            int textLength = header.second.length();
+            MPI_Send(&textLength, 1, MPI_INT, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+            MPI_Send(header.second.c_str(), textLength, MPI_CHAR, masterA, CONTENT_RESULT, MPI_COMM_WORLD);
+        }
+
+        // Відправка знайдених URL
+        int urlsCount = result.foundUrls.size();
+        MPI_Send(&urlsCount, 1, MPI_INT, masterA, URL_RESULT, MPI_COMM_WORLD);
+
+        for (const std::string& foundUrl : result.foundUrls) {
+            int foundUrlLength = foundUrl.length();
+            MPI_Send(&foundUrlLength, 1, MPI_INT, masterA, URL_RESULT, MPI_COMM_WORLD);
+            MPI_Send(foundUrl.c_str(), foundUrlLength, MPI_CHAR, masterA, URL_RESULT, MPI_COMM_WORLD);
+        }
+    }
+
+    // Повідомляємо Worker A, що ми завершили роботу
+    std::cout << "Worker B " << myRank << ": Sending final termination to Worker A " << masterA << std::endl;
+    MPI_Send(&myRank, 1, MPI_INT, masterA, TERMINATE, MPI_COMM_WORLD);
+    std::cout << "Worker B " << myRank << ": Exiting" << std::endl;
+}
+
 void processParallel(const std::vector<std::string>& URLs, std::string& vystup) {
+     int rank, size;
+     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+     // Визначення кількості воркерів A і B з розміру MPI_COMM_WORLD
+     // Припускаємо, що параметри -n і -m вже оброблені в main() і кількість процесів правильна
+
+     // Парсинг аргументів командного рядка для отримання N і M
+     int numWorkerA = 0;
+     int numWorkerB = 0;
+
+     // Майстер повинен знати ці значення, тому вони передаються через MPI_Bcast
+     if (rank == 0) {
+         // Беремо значення з глобальних змінних, які встановлюються в main()
+         extern int g_numWorkersA;
+         extern int g_numWorkersB;
+         numWorkerA = g_numWorkersA;
+         numWorkerB = g_numWorkersB;
+
+         std::cout << "Master: Using " << numWorkerA << " Workers A and " << numWorkerB << " Workers B per Worker A" << std::endl;
+     }
+
+     // Поширюємо значення N і M всім процесам
+     MPI_Bcast(&numWorkerA, 1, MPI_INT, 0, MPI_COMM_WORLD);
+     MPI_Bcast(&numWorkerB, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+     // Розподіл ролей між процесами
+     if (rank == 0) {
+         // Майстер процес
+         masterProcess(URLs, numWorkerA, numWorkerB, vystup);
+     } else if (rank <= numWorkerA) {
+         // Worker A процес
+         workerA(rank, numWorkerB, numWorkerA);
+         vystup = ""; // Worker процеси не повертають HTML
+     } else {
+         // Worker B процес
+         int workerAId = ((rank - numWorkerA - 1) / numWorkerB) + 1;
+         workerB(rank, workerAId);
+         vystup = ""; // Worker процеси не повертають HTML
+     }
  }
-
-
 
 int main(int argc, char** argv) {
 
@@ -447,8 +958,8 @@ int main(int argc, char** argv) {
          std::cout << "Привіт від процесу " << rank << " з " << world_size
                    << " на вузлі " << processor_name << std::endl;
 
-         int numWorkersA = 0;
-         int numWorkersB = 0;
+         g_numWorkersA = 0;
+         g_numWorkersB = 0;
 
 
          int result = EXIT_FAILURE;
@@ -456,9 +967,9 @@ int main(int argc, char** argv) {
              for (int i = 1; i < argc; i += 2) {
                  std::string arg = argv[i];
                  if (arg == "-n" && i + 1 < argc) {
-                     numWorkersA = std::atoi(argv[i + 1]);
+                     g_numWorkersA = std::atoi(argv[i + 1]);
                  } else if (arg == "-m" && i + 1 < argc) {
-                     numWorkersB = std::atoi(argv[i + 1]);
+                     g_numWorkersB = std::atoi(argv[i + 1]);
                  } else {
                      std::cerr << "Error: Unknown argument " << arg << std::endl;
                      std::cerr << "Usage: " << argv[0] << " -n <num_workers_A> -m <num_workers_B>" << std::endl;
@@ -467,20 +978,19 @@ int main(int argc, char** argv) {
                  }
              }
 
-             int expectedProcesses = 1 + numWorkersA + (numWorkersA * numWorkersB);
+             int expectedProcesses = 1 + g_numWorkersA + (g_numWorkersA * g_numWorkersB);
              if (world_size != expectedProcesses) {
                  if (rank == 0) {
                      std::cerr << "Error: Incorrect number of MPI processes. Expected " << expectedProcesses
                                << " but got " << world_size << std::endl;
-                     std::cerr << "For -n " << numWorkersA << " -m " << numWorkersB
-                               << " you need: 1 master + " << numWorkersA << " workers A + "
-                               << numWorkersA * numWorkersB << " workers B = " << expectedProcesses << " processes." << std::endl;
+                     std::cerr << "For -n " << g_numWorkersA << " -m " << g_numWorkersB
+                               << " you need: 1 master + " << g_numWorkersA << " workers A + "
+                               << g_numWorkersA * g_numWorkersB << " workers B = " << expectedProcesses << " processes." << std::endl;
                  }
                  MPI_Finalize();
                  return EXIT_FAILURE;
              }
 
-             std::cout << numWorkersA << " " << numWorkersB << std::endl;
 
              if (!svr.Init("../data", "0.0.0.0", 8001)) {
                  std::cerr << "Nelze inicializovat server!" << std::endl;

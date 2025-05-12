@@ -27,10 +27,12 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   
   config.vm.synced_folder './src', '/opt/src', SharedFoldersEnableSymlinksCreate: false
    
-
+   
+	
   # Master node (ID: 0)
   config.vm.define "master" do |master|
     master.vm.hostname = "master"
+	master.vm.network "forwarded_port", guest: 8001, host: "#{8001}"
     master.vm.network "private_network",
       ip: "172.16.0.100",
       virtualbox__intnet: "clusternet"
@@ -62,6 +64,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     config.vm.define "worker-a-#{i}" do |worker|
       worker.vm.hostname = "worker-a-#{i}"
       ip = "172.16.0.#{100+i}"
+	  worker.vm.network "forwarded_port", guest: 8001, host: "#{8001+i}"
       worker.vm.network "private_network",
         ip: ip,
         virtualbox__intnet: "clusternet"
@@ -75,6 +78,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       config.vm.define "worker-b-#{a}-#{b}" do |worker|
         worker.vm.hostname = "worker-b-#{a}-#{b}"
         ip = "172.16.0.#{100+worker_id}"
+		worker.vm.network "forwarded_port", guest: 8001, host: "#{8001+worker_id}"
         worker.vm.network "private_network",
           ip: ip,
           virtualbox__intnet: "clusternet"
